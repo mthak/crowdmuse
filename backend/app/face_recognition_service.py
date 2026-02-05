@@ -3,16 +3,12 @@ Face Recognition Service
 Handles face encoding, storage, and recognition using face_recognition library
 """
 import json
-import os
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import face_recognition
 import numpy as np
-from sqlalchemy.orm import Session
-
-from app.models import Student
 
 
 class FaceRecognitionService:
@@ -45,7 +41,7 @@ class FaceRecognitionService:
 
     def encode_face_from_image(self, image_path: str) -> Optional[np.ndarray]:
         """
-        Encode a face from an image file
+        Encode a face from an image file (any size).
         
         Args:
             image_path: Path to the image file
@@ -61,6 +57,36 @@ class FaceRecognitionService:
             return None
         except Exception as e:
             print(f"Error encoding face from {image_path}: {e}")
+            return None
+
+    def encode_face_from_passport_photo(self, image_path: str, min_side_px: int = 400, num_jitters: int = 2) -> Optional[np.ndarray]:
+        """
+        Encode a face from a passport-size or small photo.
+        Upscales small images so the face is at least ~96px (required by the model)
+        and uses extra jitters for more stable encoding to match live video.
+        
+        Args:
+            image_path: Path to the passport/small photo (e.g. JPG/PNG).
+            min_side_px: Minimum width or height in pixels (upscale if smaller).
+            num_jitters: Number of times to re-sample encoding (higher = more stable).
+            
+        Returns:
+            Face encoding array or None if no face found.
+        """
+        try:
+            image = face_recognition.load_image_file(image_path)
+            h, w = image.shape[:2]
+            if min(h, w) < min_side_px:
+                scale = min_side_px / min(h, w)
+                new_w, new_h = int(w * scale), int(h * scale)
+                image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            # Use num_jitters for better match to live frames (same as typical video usage)
+            encodings = face_recognition.face_encodings(image, num_jitters=num_jitters)
+            if encodings:
+                return encodings[0]
+            return None
+        except Exception as e:
+            print(f"Error encoding passport photo {image_path}: {e}")
             return None
 
     def encode_face_from_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
@@ -83,6 +109,43 @@ class FaceRecognitionService:
         except Exception as e:
             print(f"Error encoding face from frame: {e}")
             return None
+
+    def encode_face_from_bytes(self, image_bytes: bytes) -> Optional[np.ndarray]:
+        """
+        Encode a face from raw image bytes (e.g. uploaded file).
+        Supports JPEG/PNG. Decodes to BGR then encodes first face found.
+        """
+        try:
+            arr = np.frombuffer(image_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is None:
+                return None
+            return self.encode_face_from_frame(frame)
+        except Exception as e:
+            print(f"Error encoding face from bytes: {e}")
+            return None
+
+    def recognize_face_from_image_bytes(
+        self, image_bytes: bytes, tolerance: float = 0.6
+    ) -> Optional[tuple[str, float]]:
+        """
+        Decode image bytes, encode face, and match against stored encodings
+        (e.g. from passport photos). Used when server receives a captured frame.
+        """
+        encoding = self.encode_face_from_bytes(image_bytes)
+        if encoding is None:
+            return None
+        if not self._known_encodings:
+            return None
+        roll_numbers = list(self._known_encodings.keys())
+        known_encodings = [self._known_encodings[rn] for rn in roll_numbers]
+        face_distances = face_recognition.face_distance(known_encodings, encoding)
+        best_idx = int(np.argmin(face_distances))
+        best_distance = face_distances[best_idx]
+        if best_distance <= tolerance:
+            confidence = 1.0 - best_distance
+            return (roll_numbers[best_idx], confidence)
+        return None
 
     def save_encoding(self, roll_number: str, encoding: np.ndarray, name: str = ""):
         """

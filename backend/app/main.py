@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from datetime import date
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
-from .db import SessionLocal, engine
+from .db import DATA_DIR, SessionLocal, engine
+from .face_recognition_service import FaceRecognitionService
 from .models import Attendance, Base, Student
 from .schemas import (
     AttendanceMarkRequest,
@@ -15,6 +16,17 @@ from .schemas import (
 )
 
 app = FastAPI(title="CrowdMuse Backend", version="0.1.0")
+
+# Face recognition: encodings live next to DB (passport photos → encodings stored here)
+ENCODINGS_DIR = DATA_DIR / "face_encodings"
+_face_service: FaceRecognitionService | None = None
+
+
+def get_face_service() -> FaceRecognitionService:
+    global _face_service
+    if _face_service is None:
+        _face_service = FaceRecognitionService(encodings_dir=str(ENCODINGS_DIR))
+    return _face_service
 
 
 # Create tables at startup (SQLite local dev)
@@ -109,6 +121,38 @@ def list_attendance(db: Session = Depends(get_db)):
         .all()
     )
     return [_to_out(att, stu) for att, stu in records]
+
+
+@app.post("/attendance/mark-by-face", response_model=AttendanceOut, tags=["attendance"])
+async def mark_attendance_by_face(
+    image: UploadFile = File(...),
+    room: str = Form(...),
+    class_name: str = Form(...),
+    lat: str | None = Form(None),
+    lng: str | None = Form(None),
+    tolerance: float = Form(0.6),
+    db: Session = Depends(get_db),
+):
+    """
+    Accept a single face image (e.g. cropped from a video frame), match it against
+    stored encodings (from passport photos), and mark attendance if a student is found.
+    Idempotent per student/day/room/class.
+    """
+    contents = await image.read()
+    face_svc = get_face_service()
+    result = face_svc.recognize_face_from_image_bytes(contents, tolerance=tolerance)
+    if not result:
+        raise HTTPException(status_code=404, detail="No matching face found")
+    roll_number, _ = result
+    payload = AttendanceMarkRequest(
+        roll_number=roll_number,
+        room=room,
+        class_name=class_name,
+        status="present",
+        lat=lat,
+        lng=lng,
+    )
+    return mark_attendance(payload, db)
 
 
 def _to_out(att: Attendance, student: Student) -> AttendanceOut:

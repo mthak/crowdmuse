@@ -63,6 +63,8 @@ def main():
     parser.add_argument('--api-url', type=str, default='http://localhost:8000',
                        help='API base URL (default: http://localhost:8000)')
     parser.add_argument('--camera', type=int, default=0, help='Camera index (default: 0)')
+    parser.add_argument('--photo', type=str, default=None,
+                       help='Enroll from passport-size photo file (e.g. .jpg/.png) instead of camera')
     
     args = parser.parse_args()
 
@@ -86,15 +88,23 @@ def main():
 
     print("✅ Student created in database")
 
-    # Capture face from camera
-    print(f"\n📸 Capturing face from camera {args.camera}...")
-    print("   Position your face in front of the camera")
-    print("   Press 'c' to capture when ready, 'q' to quit")
-    
-    encoding = face_service.capture_face_from_camera(camera_index=args.camera, timeout=30)
+    if args.photo:
+        # Enroll from passport-size photo file
+        photo_path = Path(args.photo)
+        if not photo_path.is_file():
+            print(f"❌ Photo file not found: {args.photo}")
+            return 1
+        print(f"\n📷 Encoding face from passport photo: {args.photo}")
+        encoding = face_service.encode_face_from_passport_photo(str(photo_path))
+    else:
+        # Capture face from camera
+        print(f"\n📸 Capturing face from camera {args.camera}...")
+        print("   Position your face in front of the camera")
+        print("   Press 'c' to capture when ready, 'q' to quit")
+        encoding = face_service.capture_face_from_camera(camera_index=args.camera, timeout=30)
     
     if encoding is None:
-        print("❌ Failed to capture face. Please try again.")
+        print("❌ No face found. For passport photos use a clear frontal face; try a higher-res image.")
         return 1
 
     # Save face encoding
