@@ -1,13 +1,17 @@
 from __future__ import annotations
-from fastapi import FastAPI
+import logging
+import threading
+import time
 from datetime import date
 
-from fastapi import Depends, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
-from .db import DATA_DIR, SessionLocal, engine
+from .attendance_excel import schedule_attendance_excel_export
+from .db import DATA_DIR, SessionLocal, engine, session_scope
 from .face_recognition_service import FaceRecognitionService
 from .models import Attendance, Base, Student
+from .session_absent import apply_absent_processed_keys, run_absent_sweeps
 from .schemas import (
     AttendanceMarkRequest,
     AttendanceOut,
@@ -15,11 +19,15 @@ from .schemas import (
     StudentOut,
 )
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="CrowdMuse Backend", version="0.1.0")
 
 # Face recognition: encodings live next to DB (passport photos → encodings stored here)
 ENCODINGS_DIR = DATA_DIR / "face_encodings"
 _face_service: FaceRecognitionService | None = None
+
+BACKGROUND_POLL_SEC = 45.0
 
 
 def get_face_service() -> FaceRecognitionService:
@@ -29,10 +37,27 @@ def get_face_service() -> FaceRecognitionService:
     return _face_service
 
 
+def _background_attendance_worker() -> None:
+    """Session-end absent sweeps; Excel refresh when new absent rows are inserted."""
+    while True:
+        time.sleep(BACKGROUND_POLL_SEC)
+        try:
+            with session_scope() as db:
+                inserted, keys = run_absent_sweeps(db)
+            apply_absent_processed_keys(keys)
+            if inserted > 0:
+                schedule_attendance_excel_export()
+        except Exception:
+            logger.exception("Background attendance worker failed")
+
+
 # Create tables at startup (SQLite local dev)
 @app.on_event("startup")
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
+    t = threading.Thread(target=_background_attendance_worker, daemon=True, name="attendance-bg")
+    t.start()
+    schedule_attendance_excel_export()
 
 
 def get_db():
@@ -95,7 +120,9 @@ def mark_attendance(payload: AttendanceMarkRequest, db: Session = Depends(get_db
 
     if existing:
         # Idempotent: return the existing record
-        return _to_out(existing, student)
+        out = _to_out(existing, student)
+        schedule_attendance_excel_export()
+        return out
 
     record = Attendance(
         student_id=student.id,
@@ -109,6 +136,7 @@ def mark_attendance(payload: AttendanceMarkRequest, db: Session = Depends(get_db
     db.add(record)
     db.commit()
     db.refresh(record)
+    schedule_attendance_excel_export()
     return _to_out(record, student)
 
 

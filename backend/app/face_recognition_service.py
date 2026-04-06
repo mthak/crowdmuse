@@ -3,6 +3,7 @@ Face Recognition Service
 Handles face encoding, storage, and recognition using face_recognition library
 """
 import json
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +13,13 @@ import numpy as np
 
 
 class FaceRecognitionService:
+    # Self-learning: buffer similar live encodings, then append averaged encoding
+    SELF_LEARN_MIN_CONFIDENCE = 0.75
+    SELF_LEARN_MAX_TEMP_DISTANCE = 0.5
+    SELF_LEARN_BATCH_SIZE = 5
+    SELF_LEARN_COOLDOWN_SEC = 60.0
+    MAX_ENCODINGS_PER_STUDENT = 20
+
     def __init__(self, encodings_dir: str = "data/face_encodings"):
         """
         Initialize the face recognition service
@@ -23,6 +31,8 @@ class FaceRecognitionService:
         self.encodings_dir.mkdir(parents=True, exist_ok=True)
         self._known_encodings = {}  # roll_number → list of encodings
         self._known_roll_numbers = {}
+        self._self_learn_temp: dict[str, list[np.ndarray]] = {}
+        self._self_learn_last_commit: dict[str, float] = {}
         self._load_all_encodings()
 
     def _load_all_encodings(self):
@@ -33,11 +43,24 @@ class FaceRecognitionService:
             try:
                 with open(encoding_file, 'r') as f:
                     data = json.load(f)
-                    encoding = np.array(data['encoding'])
                     if roll_number not in self._known_encodings:
                         self._known_encodings[roll_number] = []
-                    self._known_encodings[roll_number].append(encoding)
-                    self._known_roll_numbers[roll_number] = data.get('name', '')
+                    name = data.get('name', '')
+                    if 'encodings' in data and data['encodings']:
+                        for row in data['encodings']:
+                            self._known_encodings[roll_number].append(
+                                np.asarray(row, dtype=np.float64).reshape(-1)
+                            )
+                    elif 'encoding' in data:
+                        arr = np.asarray(data['encoding'], dtype=np.float64)
+                        if arr.ndim == 1:
+                            self._known_encodings[roll_number].append(arr)
+                        else:
+                            for row in arr:
+                                self._known_encodings[roll_number].append(
+                                    np.asarray(row, dtype=np.float64).reshape(-1)
+                                )
+                    self._known_roll_numbers[roll_number] = name
             except Exception as e:
                 print(f"Error loading encoding for {roll_number}: {e}")
 
@@ -137,17 +160,74 @@ class FaceRecognitionService:
         encoding = self.encode_face_from_bytes(image_bytes)
         if encoding is None:
             return None
-        if not self._known_encodings:
+        return self.match_encoding(encoding, tolerance)
+
+    def _persist_roll_encodings(self, roll_number: str):
+        """Write all encodings for a roll number to disk."""
+        enc_list = self._known_encodings.get(roll_number)
+        if not enc_list:
+            return
+        encoding_file = self.encodings_dir / f"{roll_number}.json"
+        data = {
+            'name': self._known_roll_numbers.get(roll_number, ''),
+            'encodings': [e.reshape(-1).tolist() for e in enc_list],
+        }
+        with open(encoding_file, 'w') as f:
+            json.dump(data, f)
+
+    def match_encoding(
+        self, encoding: np.ndarray, tolerance: float = 0.6
+    ) -> Optional[tuple[str, float]]:
+        """Match a 128-d face encoding against stored encodings."""
+        if encoding is None or not self._known_encodings:
             return None
-        roll_numbers = list(self._known_encodings.keys())
-        known_encodings = [self._known_encodings[rn] for rn in roll_numbers]
-        face_distances = face_recognition.face_distance(known_encodings, encoding)
-        best_idx = int(np.argmin(face_distances))
-        best_distance = face_distances[best_idx]
+        enc = np.asarray(encoding, dtype=np.float64).reshape(-1)
+        roll_numbers = []
+        known_encodings = []
+        for rn, enc_list in self._known_encodings.items():
+            for e in enc_list:
+                roll_numbers.append(rn)
+                known_encodings.append(np.asarray(e, dtype=np.float64).reshape(-1))
+        if not known_encodings:
+            return None
+        face_distances = face_recognition.face_distance(known_encodings, enc)
+        best_match_index = int(np.argmin(face_distances))
+        best_distance = face_distances[best_match_index]
         if best_distance <= tolerance:
             confidence = 1.0 - best_distance
-            return (roll_numbers[best_idx], confidence)
+            return (roll_numbers[best_match_index], confidence)
         return None
+
+    def self_learn_from_recognition(
+        self, roll_number: str, encoding: np.ndarray, confidence: float
+    ) -> None:
+        """
+        Buffer high-confidence encodings that cluster together; after
+        SELF_LEARN_BATCH_SIZE samples, append their mean (does not replace).
+        Respects cooldown and max encodings per student.
+        """
+        if confidence < self.SELF_LEARN_MIN_CONFIDENCE:
+            return
+        enc = np.asarray(encoding, dtype=np.float64).reshape(-1)
+        if enc.size != 128:
+            return
+        now = time.monotonic()
+        last = self._self_learn_last_commit.get(roll_number)
+        if last is not None and (now - last) < self.SELF_LEARN_COOLDOWN_SEC:
+            return
+        temp = self._self_learn_temp.setdefault(roll_number, [])
+        for existing in temp:
+            d = float(face_recognition.face_distance([existing], enc)[0])
+            if d >= self.SELF_LEARN_MAX_TEMP_DISTANCE:
+                return
+        temp.append(enc.copy())
+        if len(temp) < self.SELF_LEARN_BATCH_SIZE:
+            return
+        avg = np.mean(np.stack(temp, axis=0), axis=0)
+        self._self_learn_temp[roll_number] = []
+        if self.add_encoding(roll_number, avg):
+            self._self_learn_last_commit[roll_number] = now
+            print(f"Self-learn: appended averaged encoding for {roll_number}")
 
     def save_encoding(self, roll_number: str, encoding: np.ndarray, name: str = ""):
         """
@@ -158,21 +238,12 @@ class FaceRecognitionService:
             encoding: Face encoding array
             name: Student name (optional)
         """
-        encoding_file = self.encodings_dir / f"{roll_number}.json"
-        data = {
-            'encoding': encoding.tolist(),
-            'name': name
-        }
-        with open(encoding_file, 'w') as f:
-            json.dump(data, f)
-        
-        # Update in-memory cache
         if roll_number not in self._known_encodings:
             self._known_encodings[roll_number] = []
-
-        self._known_encodings[roll_number].append(encoding)
-
+        enc = np.asarray(encoding, dtype=np.float64).reshape(-1)
+        self._known_encodings[roll_number].append(enc)
         self._known_roll_numbers[roll_number] = name
+        self._persist_roll_encodings(roll_number)
 
     def recognize_face(self, frame: np.ndarray, tolerance: float = 0.6) -> Optional[tuple[str, float]]:
         """
@@ -188,33 +259,7 @@ class FaceRecognitionService:
         encoding = self.encode_face_from_frame(frame)
         if encoding is None:
             return None
-
-        if not self._known_encodings:
-            return None
-
-        # Compare with all known faces
-        roll_numbers = []
-        known_encodings = []
-
-        for rn, enc_list in self._known_encodings.items():
-            for enc in enc_list:
-                roll_numbers.append(rn)
-                known_encodings.append(enc)
-
-        
-        # Calculate face distances
-        face_distances = face_recognition.face_distance(known_encodings, encoding)
-        
-        # Find the best match
-        best_match_index = np.argmin(face_distances)
-        best_distance = face_distances[best_match_index]
-        
-        # Check if distance is within tolerance
-        if best_distance <= tolerance:
-            confidence = 1.0 - best_distance  # Convert distance to confidence (0-1)
-            return (roll_numbers[best_match_index], confidence)
-        
-        return None
+        return self.match_encoding(encoding, tolerance)
 
     def get_student_encoding(self, roll_number: str) -> Optional[np.ndarray]:
         """Get stored encoding for a student"""
@@ -234,6 +279,8 @@ class FaceRecognitionService:
             del self._known_encodings[roll_number]
         if roll_number in self._known_roll_numbers:
             del self._known_roll_numbers[roll_number]
+        self._self_learn_temp.pop(roll_number, None)
+        self._self_learn_last_commit.pop(roll_number, None)
 
     def capture_face_from_camera(self, camera_index: int = 0, timeout: int = 10) -> Optional[np.ndarray]:
         """
@@ -317,17 +364,19 @@ class FaceRecognitionService:
         return 1
 
 
-    def add_encoding(self, roll_number: str, encoding: np.ndarray):
-        MAX_ENCODINGS = 20
-
+    def add_encoding(self, roll_number: str, encoding: np.ndarray) -> bool:
         if roll_number not in self._known_encodings:
             self._known_encodings[roll_number] = []
 
-        if len(self._known_encodings[roll_number]) >= MAX_ENCODINGS:
+        if not isinstance(self._known_encodings[roll_number], list):
+            self._known_encodings[roll_number] = [self._known_encodings[roll_number]]
+
+        if len(self._known_encodings[roll_number]) >= self.MAX_ENCODINGS_PER_STUDENT:
             return False
 
-        self._known_encodings[roll_number].append(encoding)
-
+        enc = np.asarray(encoding, dtype=np.float64).reshape(-1)
+        self._known_encodings[roll_number].append(enc)
+        self._persist_roll_encodings(roll_number)
         return True
 
 
