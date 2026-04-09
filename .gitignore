@@ -29,3 +29,4 @@ data/
 *.sqlite3
 .env
 *.xlsx
+backend/venv/
