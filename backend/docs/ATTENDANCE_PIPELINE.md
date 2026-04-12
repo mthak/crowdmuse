@@ -269,7 +269,40 @@ So: in **hybrid** there is no `--auto-mark` flag — marking is always driven by
 
 ---
 
-## 9. Main Files
+## 9. Leveraging Tapo’s “face detected” / person detection
+
+The Tapo C200 (and similar Tapo cameras) can notify when it detects a person or face. We can use that to make the pipeline **event-driven** instead of sampling every Nth frame.
+
+### What Tapo exposes
+
+- **In the app:** The camera sends “person detected” (and sometimes “face detected”) notifications to the Tapo app.
+- **On the network:** Tapo C200 supports **ONVIF**. There is no official TP-Link webhook API, but **ONVIF event subscription** can be used to receive detection events (e.g. motion / person) in your own code.
+
+### How we could use it
+
+1. **Subscribe to ONVIF events** from the Tapo (e.g. “rule engine” / motion / person events, depending on what the camera sends).  
+   Example: [Tapo-C200-event-listener](https://github.com/pablo-zarate/Tapo-C200-event-listener) (Python, ONVIF listener).
+2. **When an event is received:** treat it as “camera says something is there” and **grab the current (or next) frame** from the existing RTSP stream, run our face detection + crop, and send the crop to `POST /attendance/mark-by-face`.
+3. **Keep the rest the same:** same grabber thread (or single RTSP reader), same face-detection and mark-by-face logic; only the **trigger** changes from “every Nth frame” to “when ONVIF says detected”.
+
+That way we only process when the camera has already decided “person/face detected”, which can reduce CPU and focus on relevant moments. Cooldown (position or time) still applies so we don’t mark the same person repeatedly.
+
+### What you’d need to add (optional enhancement)
+
+- **ONVIF client** (e.g. `onvif-zeep-async` or similar) and the correct WSDL/device URLs for your Tapo (IP, ONVIF port, credentials).
+- **Event subscription** to the topics your Tapo sends (motion, person, etc.; exact names depend on firmware).
+- **Coupling to the pipeline:** when the ONVIF callback fires, signal the worker to “process the latest frame now” (or push that frame into the existing queue). No change to mark-by-face or encodings.
+
+Useful references:
+
+- [Tapo-C200-event-listener](https://github.com/pablo-zarate/Tapo-C200-event-listener) – ONVIF listener for Tapo C200.
+- [TAPO-camera-ONVIF-RTSP-and-AI-Object-Recognition](https://github.com/peterstamps/TAPO-camera-ONVIF-RTSP-and-AI-Object-Recognition) – ONVIF + RTSP + AI in one project.
+
+Right now we do **time-based sampling** (every Nth frame). Adding ONVIF would give an **event-based** option: run the same face pipeline when Tapo says “face/person detected”.
+
+---
+
+## 10. Main Files
 
 | File / Path | Role |
 |-------------|------|
@@ -281,7 +314,7 @@ So: in **hybrid** there is no `--auto-mark` flag — marking is always driven by
 
 ---
 
-## 10. Summary for the Team
+## 11. Summary for the Team
 
 - We use a **frame-based** flow: **frames → detect face → crop → send image to server → server matches to passport encodings and marks attendance.**
 - For RTSP (e.g. Tapo C200) we use a **hybrid pipeline**: **grabber thread** (keeps stream healthy), **sample every N frames**, **downscale for detection**, **full-res crop for API**, and **position cooldown** to avoid duplicate sends.

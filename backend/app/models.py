@@ -30,6 +30,19 @@ class Student(Base):
     )
 
 
+class Room(Base):
+    __tablename__ = "rooms"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=datetime.utcnow)
+    class_name: Mapped[str] = mapped_column(String(64))
+    class_location: Mapped[str] = mapped_column(String(64))
+    calsss_code:
+    class_days: 
+    attendance: Mapped[list["Attendance"]] = relationship(
+
 class Attendance(Base):
     __tablename__ = "attendance"
     __table_args__ = (
@@ -53,6 +66,9 @@ class Attendance(Base):
     # optional geotag
     lat: Mapped[str | None] = mapped_column(String(32), nullable=True)
     lng: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    attendence_time: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=datetime.utcnow)
+    attendeance_class: <chemistry>
+    
 
     student: Mapped["Student"] = relationship(back_populates="attendance")
 
