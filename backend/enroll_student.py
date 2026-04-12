@@ -15,27 +15,50 @@ sys.path.insert(0, str(Path(__file__).parent))
 from app.face_recognition_service import FaceRecognitionService
 
 
-def create_student_via_api(roll_number: str, name: str, year: int, stream: str,
-                           api_url: str = "http://localhost:8000"):
+def ensure_stream_id(api_url: str, stream_name: str) -> int | None:
+    """Return stream id for `stream_name`, creating the stream via API if needed."""
+    base = api_url.rstrip("/")
+    name = stream_name.strip()
+    try:
+        r = requests.get(f"{base}/streams", timeout=30)
+        r.raise_for_status()
+        for row in r.json():
+            if row.get("name") == name:
+                return int(row["id"])
+        c = requests.post(f"{base}/streams", json={"name": name}, timeout=30)
+        c.raise_for_status()
+        return int(c.json()["id"])
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error resolving stream: {e}")
+        return None
+
+
+def create_student_via_api(
+    roll_number: str,
+    name: str,
+    stream_id: int,
+    batch_year: int,
+    api_url: str = "http://localhost:8000",
+):
     """
-    Create student via API call
-    
+    Create student via API call (cohort = stream + batch year).
+
     Args:
         roll_number: Student roll number
         name: Student name
-        year: Academic year
-        stream: Tech stream (e.g., "Computer Science")
+        stream_id: Program/branch id from GET /streams
+        batch_year: Cohort year (e.g. 2025 for the 2025 batch)
         api_url: Base URL of the API
-        
+
     Returns:
         True if successful, False otherwise
     """
-    url = f"{api_url}/students"
+    url = f"{api_url.rstrip('/')}/students"
     payload = {
         "roll_number": roll_number,
         "name": name,
-        "year": year,
-        "stream": stream
+        "stream_id": stream_id,
+        "batch_year": batch_year,
     }
     
     try:
@@ -57,9 +80,24 @@ def main():
     parser = argparse.ArgumentParser(description='Enroll student with face recognition')
     parser.add_argument('--roll-number', type=str, required=True, help='Student roll number')
     parser.add_argument('--name', type=str, required=True, help='Student name')
-    parser.add_argument('--year', type=int, required=True, help='Academic year (1-4)')
-    parser.add_argument('--stream', type=str, required=True, 
-                       help='Tech stream (e.g., "Computer Science", "Electronics")')
+    parser.add_argument(
+        '--batch-year',
+        type=int,
+        required=True,
+        help='Cohort batch year (e.g. 2025 for Mechanical Engineering 2025)',
+    )
+    parser.add_argument(
+        '--stream',
+        type=str,
+        required=True,
+        help='Program name (e.g. "Mechanical Engineering"); created on server if new',
+    )
+    parser.add_argument(
+        '--stream-id',
+        type=int,
+        default=None,
+        help='If set, skip name lookup and use this stream id from GET /streams',
+    )
     parser.add_argument('--api-url', type=str, default='http://localhost:8000',
                        help='API base URL (default: http://localhost:8000)')
     parser.add_argument('--camera', type=int, default=0, help='Camera index (default: 0)')
@@ -80,9 +118,19 @@ def main():
             print("Cancelled.")
             return 0
 
+    stream_id = args.stream_id
+    if stream_id is None:
+        print(f"\nResolving stream: {args.stream.strip()}...")
+        stream_id = ensure_stream_id(args.api_url, args.stream)
+        if stream_id is None:
+            return 1
+        print(f"   stream_id={stream_id}")
+
     # Create student in database first
     print(f"\nCreating student record: {args.name} ({args.roll_number})...")
-    if not create_student_via_api(args.roll_number, args.name, args.year, args.stream, args.api_url):
+    if not create_student_via_api(
+        args.roll_number, args.name, stream_id, args.batch_year, args.api_url
+    ):
         print("❌ Failed to create student. Please check the API is running and try again.")
         return 1
 

@@ -7,8 +7,16 @@ This document describes the attendance pipeline we built: **why** we chose a hyb
 ## 1. Goal
 
 - **Input:** Video from a classroom camera (e.g. Tapo C200) over RTSP.
-- **Output:** Mark student attendance in the database when a face is seen, matched against **passport-size photos** stored on the server.
+- **Output:** Mark student attendance when a face is recognized **and** the student is enrolled in the class that is **scheduled in that room at the current server time**.
 - **Constraint:** Do this reliably without overloading the machine or the RTSP stream.
+
+### Timetable + enrollment (server)
+
+- **`class_schedule`**: recurring weekly rows — `room`, `day_of_week` (0=Mon…6=Sun), `start_time` / `end_time` (e.g. `09:00`–`10:00`), `class_name` (e.g. `Social Studies - s103`).
+- **`enrollments`**: links `student_id` ↔ `class_schedule_id` (who is allowed in that slot).
+- **`POST /attendance/mark-by-face-scheduled`**: image + `room` only → server finds active slot from **local time**, checks enrollment, then marks with that slot’s `class_name`.
+- **`GET /timetable/active?room=...`**: debug which slot is active now.
+- The **hybrid** `mark_attendance.py` polls `timetable/active` and calls `mark-by-face-scheduled` when a class is in session (no `class_name` on the wire from the client).
 
 ---
 

@@ -20,20 +20,21 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from types import SimpleNamespace
+from typing import Any, Optional
 
 import cv2
 import face_recognition
 import requests
 from datetime import datetime
-from app.db import session_scope
-from app.models import ClassSchedule
-
 
 # Add parent directory to path to import app modules
 sys.path.insert(0, str(Path(__file__).parent))
 
 from app.face_recognition_service import FaceRecognitionService
+
+# Active slot shape (from GET /timetable/active); same attrs as old ClassSchedule for this script
+ScheduleSlot = Any
 
 # RTSP
 RTSP_RECONNECT_AFTER_FAILURES = 30
@@ -47,8 +48,6 @@ FACE_CROP_PADDING = 0.25
 # Hybrid: default process every N frames and downscale size
 DEFAULT_SAMPLE_EVERY = 8
 DEFAULT_SCALE_WIDTH = 640
-
-from datetime import datetime
 
 def get_attendance_status(schedule):
     now = datetime.now()
@@ -68,7 +67,7 @@ def get_attendance_status(schedule):
         return "absent"
 
 
-def session_key_for(schedule: Optional[ClassSchedule]) -> Optional[tuple]:
+def session_key_for(schedule: Optional[ScheduleSlot]) -> Optional[tuple]:
     """One mark per student per schedule row per calendar day."""
     if schedule is None:
         return None
@@ -114,11 +113,11 @@ def mark_attendance_via_api(
     api_url: str = "http://localhost:8000",
     lat: str = None,
     lng: str = None,
-    schedule: Optional[ClassSchedule] = None,
+    schedule: Optional[ScheduleSlot] = None,
 ):
     """Mark attendance by roll_number (JSON API). Returns (success, roll_number)."""
     if schedule is None:
-        schedule = get_active_schedule(room)
+        schedule = get_active_schedule(room, api_url)
     if schedule is None:
         print("❌ No active class schedule for this room.")
         return False, None
@@ -192,6 +191,48 @@ def mark_attendance_by_face_image(
         return False, None
 
 
+def mark_attendance_by_face_scheduled(
+    image_bytes: bytes,
+    room: str,
+    api_url: str = "http://localhost:8000",
+    tolerance: float = 0.6,
+    lat: str = None,
+    lng: str = None,
+):
+    """
+    POST /attendance/mark-by-face-scheduled — server matches face, resolves active class for
+    `room` from timetable + server local time, checks student stream/batch vs slot cohort,
+    then marks with local date/time. Returns (success, roll_number or None).
+    """
+    base = api_url.rstrip("/")
+    url = f"{base}/attendance/mark-by-face-scheduled"
+    data = {"room": room.strip(), "tolerance": tolerance}
+    if lat:
+        data["lat"] = lat
+    if lng:
+        data["lng"] = lng
+    files = {"image": ("face.jpg", image_bytes, "image/jpeg")}
+    try:
+        response = requests.post(url, data=data, files=files)
+        if response.status_code in (400, 403, 404, 422):
+            try:
+                detail = response.json().get("detail", response.text)
+            except Exception:
+                detail = response.text
+            print(f"❌ API ({response.status_code}): {detail}")
+            return False, None
+        response.raise_for_status()
+        out = response.json()
+        roll = out.get("student_roll")
+        print(f"✅ Marked: {out.get('student_name')} ({roll}) — {out.get('class_name')}")
+        return True, roll
+    except requests.exceptions.RequestException as e:
+        err = getattr(e, "response", None)
+        text = err.text if err else str(e)
+        print(f"❌ API: {text}")
+        return False, None
+
+
 def open_video_source(rtsp_url=None, camera_index=0):
     """Open VideoCapture from RTSP URL or camera index. For RTSP, set small buffer."""
     if rtsp_url:
@@ -217,30 +258,38 @@ def crop_face_with_padding(frame_bgr, top, right, bottom, left, padding_frac=FAC
     x2 = min(w, right + pad_x)
     return frame_bgr[y1:y2, x1:x2]
 
-def get_active_schedule(room: str) -> Optional[ClassSchedule]:
-    """Return the schedule row whose time window contains now, or None."""
-    now = datetime.now().strftime("%H:%M")
+def get_active_schedule(room: str, api_url: str = "http://localhost:8000") -> Optional[SimpleNamespace]:
+    """
+    Ask the API which timetable slot is active for this room now (server local time + day-of-week).
+    """
+    base = api_url.rstrip("/")
     try:
-        with session_scope() as db:
-            schedules = (
-                db.query(ClassSchedule)
-                .filter(ClassSchedule.room == room)
-                .all()
-            )
-            for s in schedules:
-                if s.start_time <= now <= s.end_time:
-                    return s
+        r = requests.get(f"{base}/timetable/active", params={"room": room.strip()}, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("active"):
+            return None
+        return SimpleNamespace(
+            id=data["slot_id"],
+            class_name=data["class_name"],
+            start_time=data["start_time"],
+            end_time=data["end_time"],
+            room=data["room"],
+            attendance_window=data.get("attendance_window", 10),
+            late_window=data.get("late_window", 20),
+        )
     except Exception as e:
-        print(f"Schedule query error (continuing): {e}")
-    return None
+        print(f"Schedule API error (continuing): {e}")
+        return None
 
 
 def poll_schedule_state(
     room: str,
     last_poll_t: float,
-    last_schedule: Optional[ClassSchedule],
+    last_schedule: Optional[ScheduleSlot],
     poll_interval: float,
-) -> tuple[float, Optional[ClassSchedule], bool, str]:
+    api_url: str = "http://localhost:8000",
+) -> tuple[float, Optional[SimpleNamespace], bool, str]:
     """
     Refresh active schedule from DB every `poll_interval` seconds.
     Returns (new_last_poll_t, schedule, attendance_active, status_subtitle).
@@ -249,7 +298,7 @@ def poll_schedule_state(
     if last_poll_t > 0 and (t - last_poll_t) < poll_interval:
         sch = last_schedule
     else:
-        sch = get_active_schedule(room)
+        sch = get_active_schedule(room, api_url)
         last_poll_t = t
     active = sch is not None
     if active:
@@ -321,7 +370,7 @@ def run_hybrid(
     already_marked: set[str] = set()
     last_session_key = None
     last_poll_t = 0.0
-    cached_schedule: Optional[ClassSchedule] = None
+    cached_schedule: Optional[SimpleNamespace] = None
 
     last_sent_positions = {}  # (gx, gy) -> time; cooldown by face position
     frame_count = 0
@@ -337,7 +386,7 @@ def run_hybrid(
             work = latest_frame.copy()
 
         last_poll_t, cached_schedule, attendance_active, subtitle = poll_schedule_state(
-            room, last_poll_t, cached_schedule, schedule_poll_sec
+            room, last_poll_t, cached_schedule, schedule_poll_sec, api_url
         )
         sk = session_key_for(cached_schedule)
         if sk != last_session_key:
@@ -410,10 +459,9 @@ def run_hybrid(
                 if roll_number not in already_marked:
                     _, jpeg = cv2.imencode(".jpg", crop)
                     image_bytes = jpeg.tobytes()
-                    ok, roll = mark_attendance_by_face_image(
+                    ok, roll = mark_attendance_by_face_scheduled(
                         image_bytes,
                         room,
-                        cached_schedule.class_name,
                         api_url,
                         tolerance,
                         lat,
@@ -596,7 +644,7 @@ def main():
 
     read_failures = 0
     last_poll_t = 0.0
-    cached_schedule: Optional[ClassSchedule] = None
+    cached_schedule: Optional[SimpleNamespace] = None
     last_session_key = None
     already_marked: set[str] = set()
 
@@ -619,7 +667,7 @@ def main():
             read_failures = 0
 
             last_poll_t, cached_schedule, attendance_active, subtitle = poll_schedule_state(
-                args.room, last_poll_t, cached_schedule, args.schedule_poll_sec
+                args.room, last_poll_t, cached_schedule, args.schedule_poll_sec, args.api_url
             )
             sk = session_key_for(cached_schedule)
             if sk != last_session_key:
@@ -643,19 +691,24 @@ def main():
                     face_service.self_learn_from_recognition(roll_number, encoding, confidence)
 
                 if attendance_active and cached_schedule:
-                    cn = cached_schedule.class_name
                     if roll_number not in already_marked:
-                        ok, _ = mark_attendance_via_api(
-                            roll_number,
+                        crop = frame
+                        if face_locations:
+                            t, r, b, l = face_locations[0]
+                            c = crop_face_with_padding(frame, t, r, b, l)
+                            if c.size != 0:
+                                crop = c
+                        _, jpeg = cv2.imencode(".jpg", crop)
+                        ok, confirmed_roll = mark_attendance_by_face_scheduled(
+                            jpeg.tobytes(),
                             args.room,
-                            cn,
                             args.api_url,
+                            args.tolerance,
                             args.lat,
                             args.lng,
-                            schedule=cached_schedule,
                         )
-                        if ok:
-                            already_marked.add(roll_number)
+                        if ok and confirmed_roll:
+                            already_marked.add(confirmed_roll)
 
                 name = face_service._known_roll_numbers.get(roll_number, "Unknown")
                 if face_locations:

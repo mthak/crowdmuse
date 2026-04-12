@@ -95,11 +95,14 @@ def run_absent_sweeps(db: Session) -> tuple[int, list[str]]:
         processed = _load_processed()
 
     schedules = db.query(ClassSchedule).all()
-    all_students = db.query(Student).all()
     inserted = 0
     keys_completed: list[str] = []
 
+    today_dow = date.today().weekday()
+
     for schedule in schedules:
+        if schedule.day_of_week != today_dow:
+            continue
         if not _session_has_ended(schedule):
             continue
 
@@ -107,7 +110,19 @@ def run_absent_sweeps(db: Session) -> tuple[int, list[str]]:
         if key in processed:
             continue
 
-        for student in all_students:
+        cohort_students = (
+            db.query(Student)
+            .filter(
+                Student.stream_id == schedule.stream_id,
+                Student.batch_year == schedule.batch_year,
+            )
+            .all()
+        )
+        if not cohort_students:
+            keys_completed.append(key)
+            continue
+
+        for student in cohort_students:
             existing = (
                 db.query(Attendance)
                 .filter_by(

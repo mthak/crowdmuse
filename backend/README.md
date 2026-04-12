@@ -2,10 +2,36 @@
 
 This backend provides:
 - Student registry (name, roll number, year, stream, photo(s))
-- Face recognition (local OpenCV Haar + LBPH model)
-- Attendance records (room + optional geotag)
+- Face recognition (passport encodings + `mark-by-face` APIs)
+- Attendance records (room + class name + optional geotag)
+- **Room timetable** (weekly slots: room, day, time range, class label) and **enrollment** (which students are in which slot)
+- **`POST /attendance/mark-by-face-scheduled`**: recognize face, resolve active class from **server local time** + room, verify enrollment, then mark
+
+See `docs/ATTENDANCE_PIPELINE.md` for the camera pipeline.
+
+### Timetable and enrollment (quick)
+
+1. **Create slots** (example: Room123, Monday 9–10, Social Studies):
+
+   `POST /timetable/slots` with JSON body:
+   `{"room":"Room123","class_name":"Social Studies - s103","day_of_week":0,"start_time":"09:00","end_time":"10:00"}`  
+   (`day_of_week`: 0=Monday … 6=Sunday)
+
+2. **Enroll a student** in that slot:
+
+   `POST /timetable/enroll` with `{"roll_number":"CS23-001","class_schedule_id":1}`
+
+3. **Check active class now** (server clock):
+
+   `GET /timetable/active?room=Room123`
+
+4. **Hybrid camera script** calls `mark-by-face-scheduled` when a class is active (only **room** + image; class and enrollment are enforced on the server).
+
+**DB migration:** If you had an older `class_schedule` table without `day_of_week`, delete `data/crowdmuse.sqlite3` and restart the API so tables are recreated, or add the column manually.
 
 ### Setup
+
+Use **Python 3.12 or 3.13** if anything fails to install; **3.14** needs a current **pydantic** (see `requirements.txt`: `pydantic>=2.7.4`). Older pydantic builds break on 3.14 with `ForwardRef._evaluate ... recursive_guard`.
 
 Create a virtualenv and install deps:
 
