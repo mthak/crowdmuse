@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Index
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Index
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+from .camera_crypto import EncryptedPassword
 
 
 class Base(DeclarativeBase):
@@ -76,7 +78,54 @@ class Attendance(Base):
     lat: Mapped[str | None] = mapped_column(String(32), nullable=True)
     lng: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
+    # optional: which network camera produced this mark (audit / multi-cam rooms)
+    camera_id: Mapped[int | None] = mapped_column(
+        ForeignKey("cameras.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     student: Mapped["Student"] = relationship(back_populates="attendance")
+    camera: Mapped["Camera | None"] = relationship(back_populates="attendance_marks")
+
+
+class Camera(Base):
+    """
+    Network camera / stream mapped to a physical room. Use the same `room` string as
+    `class_schedule.room` and `attendance.room` so scheduled marks line up.
+    Multiple cameras may serve one room (e.g. front + back); only `is_active` ones should
+    be used by clients when polling.
+    """
+
+    __tablename__ = "cameras"
+    __table_args__ = (Index("ix_cameras_room_active", "room", "is_active"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), default="")
+    ip_address: Mapped[str] = mapped_column(String(256), index=True)
+    room: Mapped[str] = mapped_column(String(64), index=True)
+    # RTSP auth — password at rest is Fernet-encrypted via `EncryptedPassword`.
+    username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    password: Mapped[str | None] = mapped_column(EncryptedPassword(), nullable=True)
+    rtsp_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        default=lambda: datetime.now(),
+    )
+
+    attendance_marks: Mapped[list["Attendance"]] = relationship(back_populates="camera")
+
+    def effective_rtsp_url(self) -> str | None:
+        """RTSP URL with credentials for server-side / OpenCV use only (not exposed on API)."""
+        from .camera_crypto import build_rtsp_playback_url
+
+        return build_rtsp_playback_url(
+            rtsp_url=self.rtsp_url,
+            username=self.username,
+            password=self.password,
+        )
 
 
 class ClassSchedule(Base):

@@ -198,6 +198,7 @@ def mark_attendance_by_face_scheduled(
     tolerance: float = 0.6,
     lat: str = None,
     lng: str = None,
+    camera_id: int | None = None,
 ):
     """
     POST /attendance/mark-by-face-scheduled — server matches face, resolves active class for
@@ -211,6 +212,8 @@ def mark_attendance_by_face_scheduled(
         data["lat"] = lat
     if lng:
         data["lng"] = lng
+    if camera_id is not None:
+        data["camera_id"] = str(camera_id)
     files = {"image": ("face.jpg", image_bytes, "image/jpeg")}
     try:
         response = requests.post(url, data=data, files=files)
@@ -320,6 +323,7 @@ def run_hybrid(
     show_window: bool,
     stop_event: threading.Event,
     schedule_poll_sec: float = SCHEDULE_POLL_SEC,
+    camera_id: int | None = None,
 ):
     """
     Hybrid pipeline: one thread grabs frames, main thread processes every Nth frame
@@ -466,6 +470,7 @@ def run_hybrid(
                         tolerance,
                         lat,
                         lng,
+                        camera_id,
                     )
                     if ok and roll:
                         already_marked.add(roll)
@@ -585,6 +590,12 @@ def main():
     )
     parser.add_argument("--lat", type=str, default=None)
     parser.add_argument("--lng", type=str, default=None)
+    parser.add_argument(
+        "--camera-id",
+        type=int,
+        default=None,
+        help="Registered API camera id (GET /cameras); must match --room; stored on attendance rows.",
+    )
     parser.add_argument("--no-display", action="store_true", help="No preview window")
 
     args = parser.parse_args()
@@ -618,6 +629,7 @@ def main():
                 show_window=show_window,
                 stop_event=stop,
                 schedule_poll_sec=args.schedule_poll_sec,
+                camera_id=args.camera_id,
             )
         except KeyboardInterrupt:
             stop.set()
@@ -706,6 +718,7 @@ def main():
                             args.tolerance,
                             args.lat,
                             args.lng,
+                            args.camera_id,
                         )
                         if ok and confirmed_roll:
                             already_marked.add(confirmed_roll)

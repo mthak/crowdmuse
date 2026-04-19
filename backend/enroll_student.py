@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """
 Enroll Student Script
-Captures face from camera and registers student in database
+Captures face from camera and registers student in database.
+
+Writes under **`data/face_encodings/`**:
+- **`<roll>.json`** — face encoding(s) used for recognition (required).
+- **`<roll>.jpg`** — optional cropped, upscaled reference photo (unless **`--no-save-jpeg`**).
+
+Example (Mac built-in camera, sample user Asha):
+
+  python enroll_student.py --roll-number 98104ME102 --name "Asha Menon (Room 102 demo)" \\
+    --batch-year 2025 --stream "Mechanical Engineering" --camera 0
 """
 import argparse
 import sys
 from pathlib import Path
 
+import cv2
 import requests
 
 # Add parent directory to path to import app modules
@@ -62,16 +72,19 @@ def create_student_via_api(
     }
     
     try:
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=30)
+        if response.status_code == 409:
+            print("ℹ️  Student already exists in the API — continuing with face encoding only.")
+            return True
         response.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
         print(f"❌ Error creating student: {e}")
-        if hasattr(e, 'response') and e.response is not None:
+        if hasattr(e, "response") and e.response is not None:
             try:
                 error_data = e.response.json()
                 print(f"   Error: {error_data.get('detail', 'Unknown error')}")
-            except:
+            except Exception:
                 print(f"   Response: {e.response.text}")
         return False
 
@@ -100,10 +113,21 @@ def main():
     )
     parser.add_argument('--api-url', type=str, default='http://localhost:8000',
                        help='API base URL (default: http://localhost:8000)')
-    parser.add_argument('--camera', type=int, default=0, help='Camera index (default: 0)')
+    parser.add_argument('--camera', type=int, default=0, help='USB camera index (default: 0)')
+    parser.add_argument(
+        '--rtsp',
+        type=str,
+        default=None,
+        help='RTSP URL (network/IP camera). Same interactive capture as USB; use with room camera.',
+    )
     parser.add_argument('--photo', type=str, default=None,
-                       help='Enroll from passport-size photo file (e.g. .jpg/.png) instead of camera')
-    
+                       help='Enroll from image file (e.g. .jpg/.png) instead of live camera/RTSP')
+    parser.add_argument(
+        '--no-save-jpeg',
+        action='store_true',
+        help='Do not write data/face_encodings/<roll>.jpg reference photo (encoding JSON is always saved).',
+    )
+
     args = parser.parse_args()
 
     # Initialize face recognition service
@@ -136,6 +160,8 @@ def main():
 
     print("✅ Student created in database")
 
+    snapshot_bgr = None
+
     if args.photo:
         # Enroll from passport-size photo file
         photo_path = Path(args.photo)
@@ -144,21 +170,35 @@ def main():
             return 1
         print(f"\n📷 Encoding face from passport photo: {args.photo}")
         encoding = face_service.encode_face_from_passport_photo(str(photo_path))
+        img = cv2.imread(str(photo_path))
+        if img is not None:
+            snapshot_bgr = img
+    elif args.rtsp:
+        print(f"\n📸 RTSP stream: {args.rtsp}")
+        print("   Position your face in view; press 'c' to capture when a box appears, 'q' to quit")
+        encoding, snapshot_bgr = face_service.capture_face_from_rtsp(args.rtsp.strip(), timeout=60)
     else:
-        # Capture face from camera
-        print(f"\n📸 Capturing face from camera {args.camera}...")
+        # Mac / USB camera (index 0 is usually FaceTime HD)
+        print(f"\n📸 Capturing face from camera index {args.camera} (Mac: 0 is usually built-in)...")
         print("   Position your face in front of the camera")
         print("   Press 'c' to capture when ready, 'q' to quit")
-        encoding = face_service.capture_face_from_camera(camera_index=args.camera, timeout=30)
-    
+        encoding, snapshot_bgr = face_service.capture_face_from_camera(camera_index=args.camera, timeout=60)
+
     if encoding is None:
         print("❌ No face found. For passport photos use a clear frontal face; try a higher-res image.")
         return 1
 
-    # Save face encoding
+    if not args.no_save_jpeg and snapshot_bgr is not None:
+        try:
+            jpg_path = face_service.save_enrollment_jpeg(args.roll_number, snapshot_bgr)
+            print(f"\n🖼️  Reference photo saved: {jpg_path}")
+        except OSError as e:
+            print(f"⚠️  Could not save reference JPEG: {e}")
+
+    # Save face encoding (JSON in same folder; only *.json loaded for matching)
     print(f"\n💾 Saving face encoding...")
     face_service.save_encoding(args.roll_number, encoding, args.name)
-    print(f"✅ Face encoding saved for {args.name} ({args.roll_number})")
+    print(f"✅ Face encoding saved: {face_service.encodings_dir / (args.roll_number + '.json')}")
     print("\n🎉 Student enrollment complete!")
     
     return 0

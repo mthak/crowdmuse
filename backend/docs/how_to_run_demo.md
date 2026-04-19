@@ -18,15 +18,37 @@ These scripts live under **`backend/scripts/`**. They talk to a **running** Fast
    - Path: **`backend/data/face_encodings/<roll_number>.json`**
    - The stem must match **`students.roll_number`** in the database.
 
-   Enroll example (adjust paths and stream name as needed):
+   Enroll examples (API must be running; **`enroll_student.py`** creates the student if missing, or continues if the roll already exists — e.g. sample **`98104ME102`**):
 
    ```bash
    cd backend
+   # From a JPG on disk
+   python enroll_student.py --roll-number 98104ME102 --name "Asha Menon (Room 102 demo)" \
+     --batch-year 2025 --stream "Mechanical Engineering" --photo path/to/your_face.jpg
+
+   # From your network camera (full RTSP URL with credentials — same as OpenCV would use)
+   python enroll_student.py --roll-number 98104ME102 --name "Asha Menon (Room 102 demo)" \
+     --batch-year 2025 --stream "Mechanical Engineering" --rtsp 'rtsp://USER:PASS@192.168.4.28/stream1'
+
+   # USB webcam
    python enroll_student.py --roll-number 98104ME003 --name "Vikram Singh" --batch-year 2025 \
-     --stream "Mechanical Engineering" --photo path/to/photo.jpg
+     --stream "Mechanical Engineering" --camera 0
    ```
 
-4. **Optional sample data:** `python scripts/seed_sample_db.py --force` creates **`data/sample_crowdmuse.sqlite3`**. The running API uses **`data/crowdmuse.sqlite3`** by default (`app/db.py`), so seed data does **not** apply unless you point the app at the sample file. The demo scripts **create rows via the API**, so an empty default DB is fine.
+   **After the student exists** (you enrolled without a face, or you want a new reference photo), capture from the laptop webcam and upload via **`POST /students/enrollment-image`**:
+
+   ```bash
+   cd backend
+   python scripts/capture_and_upload_enrollment.py --roll-number 98104ME102 --api-url http://127.0.0.1:8000
+   ```
+
+   The roll must match an existing **`students.roll_number`**. For a live picker (or if **`--camera 0`** is the wrong device on macOS), use **`--preview`**; optional **`--camera 1`**, **`--warmup N`**. Multi-file uploads: **`POST /students/enrollment-images`** in **`/docs`**.
+
+   This writes **`data/face_encodings/<roll_number>.json`** (used for matching) and, by default, **`data/face_encodings/<roll_number>.jpg`** (cropped face, resized for a clear reference — use **`--no-save-jpeg`** to skip the image). Only **`*.json`** files are loaded as encodings.
+
+4. **Optional sample data:** `python scripts/seed_sample_db.py --force` creates **`data/sample_crowdmuse.sqlite3`**. If that file **already exists** and you only need the **`cameras`** table plus the sample **`camera001`** row (no full reseed), run **`python scripts/add_sample_camera_to_existing_db.py`** (defaults to the sample DB path). The running API uses **`data/crowdmuse.sqlite3`** by default (`app/db.py`); use **`--db data/crowdmuse.sqlite3`** on that script to patch the live file instead.
+
+5. **Room 102 sample timetable:** **`scripts/seed_sample_db.py`** also adds student **`98104ME102`** (ME 2025) and five **`class_schedule`** rows in room **`102`** (Mon–Fri 09:00–10:00) so that student is cohort-eligible for **every** class in that room. To add the same rows into an existing DB without wiping it: **`python scripts/room102_sample_data.py`** (default **`data/crowdmuse.sqlite3`**). Enroll a face for **`98104ME102`** before testing **`room_camera_attendance.py`**.
 
 For table relationships and endpoints, see **`what_all_tables.md`**.
 
@@ -98,7 +120,40 @@ The script prints a **client** clock banner so you can compare with the machine 
 
 ---
 
+## Network camera `camera001` (room 102)
+
+Default demo row: IP **`192.168.4.28`**, room **`102`**, RTSP path **`rtsp://192.168.4.28/stream1`** (no password in URL string), username/password stored with **password encrypted** in SQLite.
+
+- Set **`CROWDMUSE_CAMERA_KEY`** in production (any strong string; used to derive the Fernet key). Tests set a fixed key in `conftest.py`.
+- **`GET /cameras`** returns **`has_password`** but **never** the plaintext password.
+
+1. **Insert into the live API database** (`data/crowdmuse.sqlite3`) — API can be stopped:
+
+   ```bash
+   cd backend
+   python scripts/upsert_camera001.py
+   ```
+
+   The script prints **`effective_rtsp_url`** (with credentials) for **local use only**. Or use **`POST /cameras`** with `username` / `password` in JSON (stored encrypted).
+
+2. **Sample-only DB** (`seed_sample_db.py`) also inserts this camera into **`data/sample_crowdmuse.sqlite3`**.
+
+3. **Preview the RTSP feed** — use a URL that works on your LAN (from `upsert` output or built manually):
+
+   ```bash
+   cd backend
+   python scripts/test_rtsp_camera_preview.py --rtsp 'rtsp://USER:PASS@192.168.4.28/stream1' --no-display --frames 45
+   ```
+
+4. **Attendance client** — **`scripts/room_camera_attendance.py`** reads **`cameras`** from SQLite (RTSP + encrypted password), then runs the same loop as **`mark_attendance.py`** (face → **`mark-by-face-scheduled`** when the timetable has an active class for that room). Example: `python scripts/room_camera_attendance.py --room 102`.
+
+   Alternatively, call **`mark_attendance.py`** yourself with **`--room`**, **`--rtsp`**, and **`--camera-id`**.
+
+---
+
 ## Related
 
+- **`end_to_end_complete_guide.md`** — end-to-end setup: **streams, timetable slots, cameras, students, face upload, marking attendance** with **`curl`/Swagger** and **shell scripts** side by side.
+- **`end_to_end_flow.md`** — narrative: create student → add face → timetable → run **`mark_attendance.py`** / **`room_camera_attendance.py`** with the API up.
 - **`how_to_run_tests.md`** — pytest; **`scripts/run_api_and_tests.sh`** starts Uvicorn then runs tests.
 - **`what_all_tables.md`** — schema, cohort rules, and endpoint summary.

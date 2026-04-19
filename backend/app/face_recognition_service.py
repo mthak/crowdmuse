@@ -5,7 +5,7 @@ Handles face encoding, storage, and recognition using face_recognition library
 import json
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import face_recognition
@@ -125,11 +125,29 @@ class FaceRecognitionService:
             Face encoding array or None if no face found
         """
         try:
-            # Convert BGR to RGB (face_recognition uses RGB)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w = rgb_frame.shape[:2]
+            # Small / distant faces: upscale before HOG detection (webcams, phone crops)
+            if min(h, w) < 320:
+                scale = 320 / float(min(h, w))
+                nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                rgb_frame = cv2.resize(rgb_frame, (nw, nh), interpolation=cv2.INTER_CUBIC)
+
             encodings = face_recognition.face_encodings(rgb_frame)
             if encodings:
-                return encodings[0]  # Return first face found
+                return encodings[0]
+
+            # Fallback: explicit locations with upsampling (helps marginal lighting / angle)
+            for ups in (1, 2):
+                locs = face_recognition.face_locations(
+                    rgb_frame, number_of_times_to_upsample=ups
+                )
+                if locs:
+                    encodings = face_recognition.face_encodings(
+                        rgb_frame, known_face_locations=locs, num_jitters=1
+                    )
+                    if encodings:
+                        return encodings[0]
             return None
         except Exception as e:
             print(f"Error encoding face from frame: {e}")
@@ -282,7 +300,54 @@ class FaceRecognitionService:
         self._self_learn_temp.pop(roll_number, None)
         self._self_learn_last_commit.pop(roll_number, None)
 
-    def capture_face_from_camera(self, camera_index: int = 0, timeout: int = 10) -> Optional[np.ndarray]:
+    def save_enrollment_jpeg(self, roll_number: str, frame_bgr: np.ndarray) -> Path:
+        """
+        Save a cropped, resized reference photo as **`data/face_encodings/<roll>.jpg`**.
+        Only **`*.json`** files are loaded as encodings; JPEGs are for humans / audit / previews.
+        """
+        self.encodings_dir.mkdir(parents=True, exist_ok=True)
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        locs = face_recognition.face_locations(rgb)
+        h, w = frame_bgr.shape[:2]
+        if locs:
+            top, right, bottom, left = locs[0]
+            pad = int(max(bottom - top, right - left) * 0.2)
+            top = max(0, top - pad)
+            left = max(0, left - pad)
+            bottom = min(h, bottom + pad)
+            right = min(w, right + pad)
+            crop = frame_bgr[top:bottom, left:right].copy()
+        else:
+            crop = frame_bgr.copy()
+
+        ch, cw = crop.shape[:2]
+        if ch > 0 and cw > 0:
+            m = min(ch, cw)
+            if m < 480:
+                scale = 480 / m
+                crop = cv2.resize(
+                    crop,
+                    (max(1, int(cw * scale)), max(1, int(ch * scale))),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            mh, mw = crop.shape[:2]
+            if max(mh, mw) > 1280:
+                r = 1280 / max(mh, mw)
+                crop = cv2.resize(
+                    crop,
+                    (max(1, int(mw * r)), max(1, int(mh * r))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+        out_path = self.encodings_dir / f"{roll_number.strip()}.jpg"
+        ok = cv2.imwrite(str(out_path), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        if not ok:
+            raise OSError(f"Failed to write {out_path}")
+        return out_path
+
+    def capture_face_from_camera(
+        self, camera_index: int = 0, timeout: int = 10
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """
         Capture a face from the camera
         
@@ -291,12 +356,12 @@ class FaceRecognitionService:
             timeout: Maximum seconds to wait for face detection
             
         Returns:
-            Face encoding or None if no face detected
+            (face encoding, BGR frame at capture) or (None, None) on failure
         """
         cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
             print(f"Error: Could not open camera {camera_index}")
-            return None
+            return None, None
 
         print("Looking for a face... Press 'q' to quit, 'c' to capture")
         start_time = cv2.getTickCount()
@@ -338,18 +403,95 @@ class FaceRecognitionService:
                     # Capture the face
                     encoding = self.encode_face_from_frame(frame)
                     if encoding is not None:
+                        snap = frame.copy()
                         cap.release()
                         cv2.destroyAllWindows()
-                        return encoding
-                    else:
-                        print("Failed to encode face. Try again.")
+                        return encoding, snap
+                    print("Failed to encode face. Try again.")
 
         finally:
             cap.release()
             cv2.destroyAllWindows()
 
-        return None
-    
+        return None, None
+
+    def capture_face_from_rtsp(
+        self, rtsp_url: str, timeout: int = 60
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Same UX as capture_face_from_camera, but video source is an RTSP URL (IP / network camera).
+        """
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            print(f"Error: Could not open RTSP stream")
+            return None, None
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except cv2.error:
+            pass
+
+        print("Looking for a face... Press 'q' to quit, 'c' to capture")
+        start_time = cv2.getTickCount()
+        timeout_ticks = timeout * cv2.getTickFrequency()
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+
+                elapsed = (cv2.getTickCount() - start_time) / cv2.getTickFrequency()
+                if elapsed > timeout:
+                    print("Timeout: No face detected")
+                    break
+
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                face_locations = face_recognition.face_locations(rgb_frame)
+
+                display_frame = frame.copy()
+                if face_locations:
+                    top, right, bottom, left = face_locations[0]
+                    cv2.rectangle(display_frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                    cv2.putText(
+                        display_frame,
+                        "Face detected! Press 'c' to capture",
+                        (left, top - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                    )
+                else:
+                    cv2.putText(
+                        display_frame,
+                        "No face detected",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (0, 0, 255),
+                        2,
+                    )
+
+                cv2.imshow("Face Capture (RTSP) — c to capture, q to quit", display_frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("c") and face_locations:
+                    encoding = self.encode_face_from_frame(frame)
+                    if encoding is not None:
+                        snap = frame.copy()
+                        cap.release()
+                        cv2.destroyAllWindows()
+                        return encoding, snap
+                    print("Failed to encode face. Try again.")
+
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+
+        return None, None
+
     def get_encoding_count(self, roll_number: str) -> int:
 
         enc = self._known_encodings.get(roll_number)

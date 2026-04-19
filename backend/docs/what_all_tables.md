@@ -52,7 +52,8 @@ Links to Arjun via **`student_id`**. `class_name` matches the active slot’s **
 1. **`streams`** — Branch/program (e.g. Mechanical Engineering).
 2. **`students`** — Person + **cohort** (`stream_id`, `batch_year`) + optional `photo_path`.
 3. **`class_schedule`** — Weekly timetable row for a cohort: time, room, course, labels.
-4. **`attendance`** — Mark: which **student**, which **room** + **class label**, which **day**, **status**.
+4. **`cameras`** — Network cameras / RTSP sources: **IP (or hostname)**, **`room`** (same string as timetable/attendance), optional **`rtsp_url`**, **`is_active`**. Use **`GET /cameras?room=…&active_only=true`** to pick streams for a room; several cameras can map to one room.
+5. **`attendance`** — Mark: which **student**, which **room** + **class label**, which **day**, **status**; optional **`camera_id`** when the client reports which device produced the mark.
 
 There is **no** `enrollments` table. Eligibility = student’s `stream_id` and `batch_year` equal the slot’s `stream_id` and `batch_year`.
 
@@ -113,6 +114,8 @@ Enrollment scripts (e.g. `enroll_student.py`) typically: **create the `students`
 | `POST /attendance/mark-scheduled` | From active slot | Yes (`room` + optional `at`, default now) | Calendar date of that same instant |
 | `POST /attendance/mark-by-face` | Client sends it | No | Same as `mark` |
 | `POST /attendance/mark-by-face-scheduled` | From active slot | Yes (`room` + `datetime.now()` after face match) | Calendar date of that same instant |
+
+All of the above accept optional **`camera_id`** (must match **`room`** and an **active** row in **`cameras`**). **`mark_attendance.py`** supports **`--camera-id`** so RTSP/USB runs tag marks with the configured device.
 
 ---
 
@@ -185,11 +188,19 @@ flowchart LR
 - **`start_time`**, **`end_time`** (`HH:MM`) — used by the server for active-slot resolution
 - **`attendance_window`**, **`late_window`** (minutes; stored for clients / tooling; not used by server slot lookup)
 
+### `cameras`
+
+- **`id`**, **`name`**, **`ip_address`**, **`room`**, **`username`** (optional)
+- **`password`** — Fernet-encrypted at rest (key: env **`CROWDMUSE_CAMERA_KEY`**); never returned by the HTTP API (`has_password` only). Decrypted only in server process memory (e.g. `Camera.effective_rtsp_url()`).
+- Optional **`rtsp_url`** — prefer **without** embedded credentials (e.g. `rtsp://192.168.x.x/stream1`); build full URL in code with decrypted username/password.
+- **`is_active`**, optional **`notes`**, **`created_at`**
+
 ### `attendance`
 
 - **`student_id`** (FK → `students.id`)
 - **`room`**, **`class_name`**, **`status`**, **`date_key`** (`YYYY-MM-DD`), **`marked_at`**
 - Optional **`lat`**, **`lng`**
+- Optional **`camera_id`** (FK → `cameras.id`, `ON DELETE SET NULL`)
 - Unique on **`(student_id, date_key, room, class_name)`** — idempotent re-mark for the same session
 
 ---

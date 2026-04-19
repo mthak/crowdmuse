@@ -2,6 +2,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from pathlib import Path
+
+import cv2
+import numpy as np
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 
@@ -10,16 +14,22 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from .attendance_excel import schedule_attendance_excel_export
-from .db import DATA_DIR, SessionLocal, engine, session_scope
+from .db import DATA_DIR, SessionLocal, engine, migrate_sqlite_schema, session_scope
 from .face_recognition_service import FaceRecognitionService
-from .models import Attendance, Base, ClassSchedule, Stream, Student
+from .models import Attendance, Base, Camera, ClassSchedule, Stream, Student
 from .session_absent import apply_absent_processed_keys, run_absent_sweeps
 from .schemas import (
     AttendanceMarkRequest,
     AttendanceMarkScheduledRequest,
     AttendanceOut,
+    CameraCreate,
+    CameraOut,
+    CameraUpdate,
     ClassScheduleCreate,
     ClassScheduleOut,
+    EnrollmentGalleryItemOut,
+    EnrollmentGalleryUploadOut,
+    EnrollmentImageUploadOut,
     StreamCreate,
     StreamOut,
     StudentCreate,
@@ -36,9 +46,18 @@ _face_service: FaceRecognitionService | None = None
 BACKGROUND_POLL_SEC = 45.0
 
 
+def _data_relative_display(path: Path) -> str:
+    """Prefer `data/...` under the backend package root; fall back to the absolute path."""
+    try:
+        return str(path.resolve().relative_to(DATA_DIR.parent.resolve()))
+    except ValueError:
+        return str(path)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    migrate_sqlite_schema(engine)
     t = threading.Thread(target=_background_attendance_worker, daemon=True, name="attendance-bg")
     t.start()
     schedule_attendance_excel_export()
@@ -83,6 +102,40 @@ def get_db():
         db.close()
 
 
+def _camera_to_out(row: Camera) -> CameraOut:
+    """API response: never includes plaintext password."""
+    return CameraOut(
+        id=row.id,
+        name=row.name,
+        ip_address=row.ip_address,
+        room=row.room,
+        username=row.username,
+        has_password=bool(row.password),
+        rtsp_url=row.rtsp_url,
+        is_active=row.is_active,
+        notes=row.notes,
+        created_at=row.created_at,
+    )
+
+
+def _validate_camera_for_room(db: Session, room: str, camera_id: int | None) -> int | None:
+    """Return resolved camera id or None; raise HTTPException if id invalid or room mismatch."""
+    if camera_id is None:
+        return None
+    cam = db.query(Camera).filter_by(id=camera_id).first()
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    if not cam.is_active:
+        raise HTTPException(status_code=400, detail="Camera is not active")
+    room_s = room.strip()
+    if cam.room.strip() != room_s:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Camera is assigned to room {cam.room!r}, not {room_s!r}",
+        )
+    return cam.id
+
+
 @app.get("/health", tags=["system"])
 def health():
     return {"status": "ok"}
@@ -105,6 +158,85 @@ def create_stream(payload: StreamCreate, db: Session = Depends(get_db)):
 @app.get("/streams", response_model=list[StreamOut], tags=["streams"])
 def list_streams(db: Session = Depends(get_db)):
     return db.query(Stream).order_by(Stream.name).all()
+
+
+# Cameras (network / RTSP sources tied to a room for attendance clients)
+@app.post("/cameras", response_model=CameraOut, tags=["cameras"])
+def create_camera(payload: CameraCreate, db: Session = Depends(get_db)):
+    row = Camera(
+        name=(payload.name or "").strip(),
+        ip_address=payload.ip_address.strip(),
+        room=payload.room.strip(),
+        username=payload.username.strip() if payload.username else None,
+        password=payload.password if payload.password else None,
+        rtsp_url=payload.rtsp_url.strip() if payload.rtsp_url else None,
+        is_active=payload.is_active,
+        notes=payload.notes.strip() if payload.notes else None,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _camera_to_out(row)
+
+
+@app.get("/cameras", response_model=list[CameraOut], tags=["cameras"])
+def list_cameras(
+    room: str | None = None,
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+):
+    """List cameras; filter by `room` and/or only `is_active` rows."""
+    q = db.query(Camera).order_by(Camera.room, Camera.id)
+    if room is not None:
+        q = q.filter(Camera.room == room.strip())
+    if active_only:
+        q = q.filter(Camera.is_active.is_(True))
+    return [_camera_to_out(r) for r in q.all()]
+
+
+@app.get("/cameras/{camera_id}", response_model=CameraOut, tags=["cameras"])
+def get_camera(camera_id: int, db: Session = Depends(get_db)):
+    row = db.query(Camera).filter_by(id=camera_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    return _camera_to_out(row)
+
+
+@app.patch("/cameras/{camera_id}", response_model=CameraOut, tags=["cameras"])
+def update_camera(camera_id: int, payload: CameraUpdate, db: Session = Depends(get_db)):
+    row = db.query(Camera).filter_by(id=camera_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    data = payload.model_dump(exclude_unset=True)
+    if "name" in data and data["name"] is not None:
+        row.name = data["name"].strip()
+    if "ip_address" in data and data["ip_address"] is not None:
+        row.ip_address = data["ip_address"].strip()
+    if "room" in data and data["room"] is not None:
+        row.room = data["room"].strip()
+    if "username" in data:
+        row.username = data["username"].strip() if data["username"] else None
+    if "password" in data:
+        row.password = data["password"] if data["password"] else None
+    if "rtsp_url" in data:
+        row.rtsp_url = data["rtsp_url"].strip() if data["rtsp_url"] else None
+    if "is_active" in data and data["is_active"] is not None:
+        row.is_active = data["is_active"]
+    if "notes" in data:
+        row.notes = data["notes"].strip() if data["notes"] else None
+    db.commit()
+    db.refresh(row)
+    return _camera_to_out(row)
+
+
+@app.delete("/cameras/{camera_id}", tags=["cameras"])
+def delete_camera(camera_id: int, db: Session = Depends(get_db)):
+    row = db.query(Camera).filter_by(id=camera_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    db.delete(row)
+    db.commit()
+    return {"ok": True}
 
 
 # Students (cohort = stream_id + batch_year)
@@ -133,6 +265,129 @@ def create_student(payload: StudentCreate, db: Session = Depends(get_db)):
 @app.get("/students", response_model=list[StudentOut], tags=["students"])
 def list_students(db: Session = Depends(get_db)):
     return db.query(Student).order_by(Student.created_at.desc()).all()
+
+
+@app.post("/students/enrollment-image", response_model=EnrollmentImageUploadOut, tags=["students"])
+async def upload_student_enrollment_image(
+    roll_number: str = Form(..., description="Existing student roll number"),
+    image: UploadFile = File(..., description="JPEG/PNG from phone or laptop camera"),
+    replace_encoding: bool = Form(
+        True,
+        description="If true, replace existing face encoding JSON with this face; if false, append one encoding vector",
+    ),
+    db: Session = Depends(get_db),
+    face_svc: FaceRecognitionService = Depends(get_face_service),
+):
+    """
+    Store a **reference photo** under `data/face_encodings/<roll>.jpg` (cropped/resized) and update
+    face encodings used for recognition (`data/face_encodings/<roll>.json`). Use from a phone browser
+    or app via multipart form (**`roll_number`** + **`image`** file).
+
+    **Student must already exist** (`POST /students`). Secure this route in production (auth).
+    """
+    roll = roll_number.strip()
+    student = db.query(Student).filter_by(roll_number=roll).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    contents = await image.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    frame = cv2_imdecode_bgr(contents)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Could not decode image (use JPEG or PNG)")
+
+    encoding = face_svc.encode_face_from_frame(frame)
+    if encoding is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No face detected in image. Use a well-lit, frontal face, larger in frame, "
+                "or try scripts/capture_and_upload_enrollment.py --preview or --camera 1."
+            ),
+        )
+
+    jpeg_path = face_svc.save_enrollment_jpeg(roll, frame)
+    rel_jpeg = _data_relative_display(jpeg_path)
+
+    if replace_encoding:
+        face_svc.delete_encoding(roll)
+    face_svc.save_encoding(roll, encoding, student.name)
+
+    return EnrollmentImageUploadOut(
+        roll_number=roll,
+        student_name=student.name,
+        jpeg_path=rel_jpeg,
+        encoding_updated=True,
+        message="Reference JPEG and face encoding saved.",
+    )
+
+
+@app.post("/students/enrollment-images", response_model=EnrollmentGalleryUploadOut, tags=["students"])
+async def upload_student_enrollment_images(
+    roll_number: str = Form(...),
+    images: list[UploadFile] = File(..., description="One or more photos"),
+    replace_encoding: bool = Form(True),
+    db: Session = Depends(get_db),
+    face_svc: FaceRecognitionService = Depends(get_face_service),
+):
+    """
+    Save **each** image under `data/enrollment_gallery/<roll>/000.jpg`, `001.jpg`, …
+    The **first** image in which a face is detected also updates the primary **`face_encodings/<roll>.jpg`**
+    and encoding JSON (same rules as **`/students/enrollment-image`**).
+    """
+    roll = roll_number.strip()
+    student = db.query(Student).filter_by(roll_number=roll).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    gallery_root = DATA_DIR / "enrollment_gallery" / roll
+    gallery_root.mkdir(parents=True, exist_ok=True)
+
+    items: list[EnrollmentGalleryItemOut] = []
+    encoding_updated = False
+
+    for i, up in enumerate(images):
+        contents = await up.read()
+        if not contents:
+            items.append(EnrollmentGalleryItemOut(path="", face_detected=False))
+            continue
+        frame = cv2_imdecode_bgr(contents)
+        if frame is None:
+            items.append(EnrollmentGalleryItemOut(path="", face_detected=False))
+            continue
+
+        safe_name = f"{i:03d}_{(up.filename or 'upload').replace('/', '_')[:80]}"
+        if not safe_name.lower().endswith((".jpg", ".jpeg", ".png")):
+            safe_name += ".jpg"
+        out_path = gallery_root / safe_name
+        cv2.imwrite(str(out_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        rel = _data_relative_display(out_path)
+
+        enc = face_svc.encode_face_from_frame(frame)
+        detected = enc is not None
+        if enc is not None and not encoding_updated:
+            face_svc.save_enrollment_jpeg(roll, frame)
+            if replace_encoding:
+                face_svc.delete_encoding(roll)
+            face_svc.save_encoding(roll, enc, student.name)
+            encoding_updated = True
+
+        items.append(EnrollmentGalleryItemOut(path=rel, face_detected=detected))
+
+    return EnrollmentGalleryUploadOut(
+        roll_number=roll,
+        student_name=student.name,
+        items=items,
+        encoding_updated=encoding_updated,
+    )
+
+
+def cv2_imdecode_bgr(image_bytes: bytes):
+    """Decode image bytes to BGR ndarray; None if invalid."""
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
 # Timetable (weekly rows per stream + batch_year cohort)
@@ -224,6 +479,7 @@ def _persist_attendance_mark(
     date_key: str,
     lat: str | None,
     lng: str | None,
+    camera_id: int | None = None,
 ) -> AttendanceOut:
     """Insert or return existing row for (student, date_key, room, class_name). `marked_at` = insert time."""
     room_s = room.strip()
@@ -250,6 +506,7 @@ def _persist_attendance_mark(
         marked_at=datetime.now(),
         lat=lat,
         lng=lng,
+        camera_id=camera_id,
     )
     db.add(record)
     db.commit()
@@ -268,6 +525,7 @@ def mark_attendance(payload: AttendanceMarkRequest, db: Session = Depends(get_db
     student = db.query(Student).filter_by(roll_number=payload.roll_number).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
+    cam_id = _validate_camera_for_room(db, payload.room, payload.camera_id)
     today_key = date.today().isoformat()
     return _persist_attendance_mark(
         db,
@@ -278,6 +536,7 @@ def mark_attendance(payload: AttendanceMarkRequest, db: Session = Depends(get_db
         date_key=today_key,
         lat=payload.lat,
         lng=payload.lng,
+        camera_id=cam_id,
     )
 
 
@@ -297,7 +556,9 @@ def mark_attendance_scheduled(payload: AttendanceMarkScheduledRequest, db: Sessi
     if when.tzinfo is not None:
         when = when.astimezone().replace(tzinfo=None)
 
-    slot, err = resolve_student_scheduled_attendance(db, student, payload.room.strip(), when=when)
+    room_s = payload.room.strip()
+    cam_id = _validate_camera_for_room(db, room_s, payload.camera_id)
+    slot, err = resolve_student_scheduled_attendance(db, student, room_s, when=when)
     if slot is None:
         code = 403 if err.startswith("Student's stream") else 400
         raise HTTPException(status_code=code, detail=err)
@@ -306,12 +567,13 @@ def mark_attendance_scheduled(payload: AttendanceMarkScheduledRequest, db: Sessi
     return _persist_attendance_mark(
         db,
         student=student,
-        room=payload.room.strip(),
+        room=room_s,
         class_name=slot.class_name,
         status=payload.status,
         date_key=session_date_key,
         lat=payload.lat,
         lng=payload.lng,
+        camera_id=cam_id,
     )
 
 
@@ -393,6 +655,7 @@ async def mark_attendance_by_face(
     class_name: str = Form(...),
     lat: str | None = Form(None),
     lng: str | None = Form(None),
+    camera_id: int | None = Form(None),
     tolerance: float = Form(0.6),
     db: Session = Depends(get_db),
     face_svc: FaceRecognitionService = Depends(get_face_service),
@@ -414,6 +677,7 @@ async def mark_attendance_by_face(
         status="present",
         lat=lat,
         lng=lng,
+        camera_id=camera_id,
     )
     return mark_attendance(payload, db)
 
@@ -424,6 +688,7 @@ async def mark_attendance_by_face_scheduled(
     room: str = Form(...),
     lat: str | None = Form(None),
     lng: str | None = Form(None),
+    camera_id: int | None = Form(None),
     tolerance: float = Form(0.6),
     db: Session = Depends(get_db),
     face_svc: FaceRecognitionService = Depends(get_face_service),
@@ -442,8 +707,10 @@ async def mark_attendance_by_face_scheduled(
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
 
+    room_s = room.strip()
+    cam_id = _validate_camera_for_room(db, room_s, camera_id)
     when = datetime.now()
-    slot, err = resolve_student_scheduled_attendance(db, student, room.strip(), when=when)
+    slot, err = resolve_student_scheduled_attendance(db, student, room_s, when=when)
     if slot is None:
         code = 403 if err.startswith("Student's stream") else 400
         raise HTTPException(status_code=code, detail=err)
@@ -451,12 +718,13 @@ async def mark_attendance_by_face_scheduled(
     return _persist_attendance_mark(
         db,
         student=student,
-        room=room.strip(),
+        room=room_s,
         class_name=slot.class_name,
         status="present",
         date_key=when.date().isoformat(),
         lat=lat,
         lng=lng,
+        camera_id=cam_id,
     )
 
 
@@ -473,5 +741,6 @@ def _to_out(att: Attendance, student: Student) -> AttendanceOut:
         marked_at=att.marked_at,
         lat=att.lat,
         lng=att.lng,
+        camera_id=att.camera_id,
     )
 

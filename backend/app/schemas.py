@@ -35,12 +35,38 @@ class StudentOut(BaseModel):
     created_at: datetime
 
 
+class EnrollmentImageUploadOut(BaseModel):
+    """Response after storing an enrollment photo + optional face encoding update."""
+
+    roll_number: str
+    student_name: str
+    jpeg_path: str
+    encoding_updated: bool
+    message: str = ""
+
+
+class EnrollmentGalleryItemOut(BaseModel):
+    path: str
+    face_detected: bool
+
+
+class EnrollmentGalleryUploadOut(BaseModel):
+    roll_number: str
+    student_name: str
+    items: list[EnrollmentGalleryItemOut]
+    encoding_updated: bool
+
+
 class AttendanceCreate(BaseModel):
     room: str = Field(min_length=1, max_length=64)
     class_name: str = Field(min_length=1, max_length=128)
     status: str = Field(default="present")
     lat: str | None = None
     lng: str | None = None
+    camera_id: int | None = Field(
+        default=None,
+        description="Optional FK to `cameras.id`; must match `room` and be active.",
+    )
 
 
 class AttendanceMarkRequest(AttendanceCreate):
@@ -65,6 +91,10 @@ class AttendanceMarkScheduledRequest(BaseModel):
     status: str = Field(default="present")
     lat: str | None = None
     lng: str | None = None
+    camera_id: int | None = Field(
+        default=None,
+        description="Optional FK to `cameras.id`; must match `room` and be active.",
+    )
 
 
 class ClassScheduleCreate(BaseModel):
@@ -106,3 +136,46 @@ class AttendanceOut(BaseModel):
     marked_at: datetime
     lat: str | None
     lng: str | None
+    camera_id: int | None = None
+
+
+class CameraCreate(BaseModel):
+    name: str = Field(default="", max_length=128)
+    ip_address: str = Field(min_length=1, max_length=256, description="IPv4/IPv6 or hostname")
+    room: str = Field(min_length=1, max_length=64, description="Same label as timetable/attendance room, e.g. 102")
+    username: str | None = Field(default=None, max_length=128, description="RTSP login (optional)")
+    password: str | None = Field(default=None, description="RTSP password (optional; sensitive)")
+    rtsp_url: str | None = Field(
+        default=None,
+        description="Full RTSP URL for OpenCV; optional if clients build from IP + username/password",
+    )
+    is_active: bool = True
+    notes: str | None = None
+
+
+class CameraUpdate(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+    ip_address: str | None = Field(default=None, min_length=1, max_length=256)
+    room: str | None = Field(default=None, min_length=1, max_length=64)
+    username: str | None = None
+    password: str | None = None
+    rtsp_url: str | None = None
+    is_active: bool | None = None
+    notes: str | None = None
+
+
+class CameraOut(BaseModel):
+    """Public camera record — **password is never serialized** (use `has_password`)."""
+
+    id: int
+    name: str
+    ip_address: str
+    room: str
+    username: str | None
+    has_password: bool = False
+    rtsp_url: str | None
+    is_active: bool
+    notes: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import os
+
+# Stable Fernet material for camera password encryption in tests (must be set before `app` import).
+os.environ.setdefault("CROWDMUSE_CAMERA_KEY", "pytest-crowdmuse-camera-encryption-key")
+
 from unittest.mock import MagicMock, patch
 
 import pytest

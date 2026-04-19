@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 
@@ -32,4 +32,28 @@ def session_scope() -> Session:
         raise
     finally:
         session.close()
+
+
+def migrate_sqlite_schema(engine) -> None:
+    """
+    Lightweight migrations for existing SQLite files (no Alembic).
+    """
+    insp = inspect(engine)
+    tables = set(insp.get_table_names())
+
+    with engine.connect() as conn:
+        if "attendance" in tables:
+            cols = {c["name"] for c in insp.get_columns("attendance")}
+            if "camera_id" not in cols:
+                conn.execute(text("ALTER TABLE attendance ADD COLUMN camera_id INTEGER"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_attendance_camera_id ON attendance (camera_id)"))
+                conn.commit()
+
+        if "cameras" in tables:
+            cols = {c["name"] for c in insp.get_columns("cameras")}
+            if "username" not in cols:
+                conn.execute(text("ALTER TABLE cameras ADD COLUMN username VARCHAR(128)"))
+            if "password" not in cols:
+                conn.execute(text("ALTER TABLE cameras ADD COLUMN password TEXT"))
+            conn.commit()
 

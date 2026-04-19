@@ -15,6 +15,11 @@ Then, from the `backend/` directory:
 Or from the repo root:
 
   python backend/scripts/seed_sample_db.py --force
+
+If **`sample_crowdmuse.sqlite3` already exists** and you only need the **`cameras`** schema plus the
+sample **camera001** row (without wiping the DB), use:
+
+  python scripts/add_sample_camera_to_existing_db.py
 """
 from __future__ import annotations
 
@@ -30,7 +35,7 @@ BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.models import Attendance, Base, ClassSchedule, Stream, Student  # noqa: E402
+from app.models import Attendance, Base, Camera, ClassSchedule, Stream, Student  # noqa: E402
 
 SAMPLE_DB_PATH = BACKEND_ROOT / "data" / "sample_crowdmuse.sqlite3"
 
@@ -55,6 +60,13 @@ def seed(session: Session) -> None:
         Student(roll_number="98104ME001", name="Arjun Patel", stream_id=me.id, batch_year=2025),
         Student(roll_number="98104ME002", name="Sneha Rao", stream_id=me.id, batch_year=2025),
         Student(roll_number="98104ME003", name="Vikram Singh", stream_id=me.id, batch_year=2025),
+        # Eligible for every `class_schedule` row in room 102 (same cohort: ME + 2025).
+        Student(
+            roll_number="98104ME102",
+            name="Asha Menon (Room 102 demo)",
+            stream_id=me.id,
+            batch_year=2025,
+        ),
     ]
     students_me_2026 = [
         Student(roll_number="98104ME101", name="New Admit One", stream_id=me.id, batch_year=2026),
@@ -127,7 +139,45 @@ def seed(session: Session) -> None:
         )
     )
 
+    # Room 102 — ME 2025: one slot per weekday (pairs with `cameras.room` = "102" demos).
+    room_102_slots: list[tuple[int, str, str, str, str]] = [
+        (0, "09:00", "10:00", "PHY102A", "Physics — Mechanics"),
+        (1, "09:00", "10:00", "PHY102B", "Physics — Waves"),
+        (2, "09:00", "10:00", "LAB102", "Measurements Lab"),
+        (3, "09:00", "10:00", "TUT102", "Problem Solving Tutorial"),
+        (4, "09:00", "10:00", "REV102", "Weekly Review"),
+    ]
+    for dow, start, end, code, title in room_102_slots:
+        session.add(
+            ClassSchedule(
+                stream_id=me.id,
+                batch_year=2025,
+                room="102",
+                course_code=code,
+                class_name=title,
+                day_of_week=dow,
+                start_time=start,
+                end_time=end,
+                attendance_window=10,
+                late_window=20,
+            )
+        )
+
     session.flush()
+
+    # --- Network camera (same room label as timetable when you add room 102 slots) ---
+    session.add(
+        Camera(
+            name="camera001",
+            ip_address=os.getenv("CAMERA_IP"),
+            room=os.getenv("CAMERA_ROOM"),
+            username=os.getenv("CAMERA_USERNAME"),
+            password=os.getenv("CAMERA_PASSWORD"),
+            rtsp_url=f"rtsp://{username}:{password}@{ip_address}/stream1",
+            is_active=True,
+            notes="Sample ONVIF / generic RTSP (adjust path for your device).",
+        )
+    )
 
     # --- Sample attendance (same student, different classes same day) ---
     arjun = students_me_2025[0]
@@ -191,6 +241,9 @@ def main() -> int:
     print(f"  sqlite3 {out} \"SELECT * FROM streams;\"")
     print(f"  sqlite3 {out} \"SELECT roll_number, name, stream_id, batch_year FROM students;\"")
     print(f"  sqlite3 {out} \"SELECT id, stream_id, batch_year, day_of_week, start_time, room, course_code FROM class_schedule ORDER BY stream_id, batch_year, day_of_week, start_time;\"")
+    print(f"  sqlite3 {out} \"SELECT id, name, ip_address, room, username, rtsp_url FROM cameras;\"")
+    print(f"  sqlite3 {out} \"SELECT day_of_week, start_time, room, course_code, class_name FROM class_schedule WHERE room='102' ORDER BY day_of_week;\"")
+    print(f"  sqlite3 {out} \"SELECT roll_number, name FROM students WHERE roll_number='98104ME102';\"")
     return 0
 
 
